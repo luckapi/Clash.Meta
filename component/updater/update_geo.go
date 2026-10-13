@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -26,6 +27,10 @@ var (
 	updateInterval int
 
 	updatingGeo atomic.Bool
+
+	GeoUpdateHook   func(geoType string, updating bool, skipped bool, updateErr error)
+	geoUpdaterMutex sync.Mutex
+	geoUpdaterCancel context.CancelFunc
 )
 
 func GeoAutoUpdate() bool {
@@ -216,20 +221,31 @@ func updateGeoDatabases() error {
 
 var ErrGetDatabaseUpdateSkip = errors.New("GEO database is updating, skip")
 
-func UpdateGeoDatabases() error {
+func UpdateGeoDatabases() (err error) {
 	log.Infoln("[GEO] Start updating GEO database")
 
 	if updatingGeo.Load() {
+		if GeoUpdateHook != nil {
+			GeoUpdateHook("all", false, true, ErrGetDatabaseUpdateSkip)
+		}
 		return ErrGetDatabaseUpdateSkip
 	}
 
 	updatingGeo.Store(true)
-	defer updatingGeo.Store(false)
+	if GeoUpdateHook != nil {
+		GeoUpdateHook("all", true, false, nil)
+	}
+	defer func() {
+		updatingGeo.Store(false)
+		if GeoUpdateHook != nil {
+			GeoUpdateHook("all", false, false, err)
+		}
+	}()
 
 	log.Infoln("[GEO] Updating GEO database")
 
-	if err := updateGeoDatabases(); err != nil {
-		log.Infoln("[GEO] update GEO database error: %s", err.Error())
+	if err = updateGeoDatabases(); err != nil {
+		log.Errorln("[GEO] update GEO database error: %s", err.Error())
 		return err
 	}
 
@@ -256,22 +272,35 @@ func getUpdateTime() (time time.Time, err error) {
 }
 
 func RegisterGeoUpdater() {
-	registerGeoUpdater(context.Background())
+	registerGeoUpdater(false)
 }
 
-func registerGeoUpdater(ctx context.Context) {
+func RegisterGeoUpdaterWithCancel() {
+	registerGeoUpdater(true)
+}
+
+func registerGeoUpdater(cancelPrevious bool) {
 	if updateInterval <= 0 {
-		log.Infoln("[GEO] Invalid update interval: %d", updateInterval)
+		log.Errorln("[GEO] Invalid update interval: %d", updateInterval)
 		return
 	}
 
-	go func() {
+	geoUpdaterMutex.Lock()
+	if cancelPrevious && geoUpdaterCancel != nil {
+		geoUpdaterCancel()
+		geoUpdaterCancel = nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	geoUpdaterCancel = cancel
+	geoUpdaterMutex.Unlock()
+
+	go func(ctx context.Context) {
 		ticker := time.NewTicker(time.Duration(updateInterval) * time.Hour)
 		defer ticker.Stop()
 
 		lastUpdate, err := getUpdateTime()
 		if err != nil {
-			log.Infoln("[GEO] Get GEO database update time error: %s", err.Error())
+			log.Errorln("[GEO] Get GEO database update time error: %s", err.Error())
 			return
 		}
 
@@ -279,7 +308,7 @@ func registerGeoUpdater(ctx context.Context) {
 		if lastUpdate.Add(time.Duration(updateInterval) * time.Hour).Before(time.Now()) {
 			log.Infoln("[GEO] Database has not been updated for %v, update now", time.Duration(updateInterval)*time.Hour)
 			if err := UpdateGeoDatabases(); err != nil {
-				log.Infoln("[GEO] Failed to update GEO database: %s", err.Error())
+				log.Errorln("[GEO] Failed to update GEO database: %s", err.Error())
 				return
 			}
 		}
@@ -287,14 +316,13 @@ func registerGeoUpdater(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
-				log.Infoln("[GEO] Geo updater stopped")
 				return
 			case <-ticker.C:
 				log.Infoln("[GEO] updating database every %d hours", updateInterval)
 				if err := UpdateGeoDatabases(); err != nil {
-					log.Infoln("[GEO] Failed to update GEO database: %s", err.Error())
+					log.Errorln("[GEO] Failed to update GEO database: %s", err.Error())
 				}
 			}
 		}
-	}()
+	}(ctx)
 }
