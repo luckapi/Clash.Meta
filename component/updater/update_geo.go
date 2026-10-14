@@ -28,10 +28,16 @@ var (
 
 	updatingGeo atomic.Bool
 
-	GeoUpdateHook   func(geoType string, updating bool, skipped bool, updateErr error)
-	geoUpdaterMutex sync.Mutex
+	GeoUpdateHook    func(geoType string, updating bool, skipped bool, updateErr error)
+	geoUpdaterMutex  sync.Mutex
 	geoUpdaterCancel context.CancelFunc
 )
+
+func sendGeoUpdateStatus(geoType string, updating bool, skipped bool, updateErr error) {
+	if GeoUpdateHook != nil {
+		GeoUpdateHook(geoType, updating, skipped, updateErr)
+	}
+}
 
 func GeoAutoUpdate() bool {
 	return autoUpdate
